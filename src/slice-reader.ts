@@ -17,25 +17,18 @@ import makeDebug from 'debug';
 import Zip from 'adm-zip';
 import * as rimraf from 'rimraf';
 import { DeployStructure } from './deploy-struct';
-import {
-  S3Client,
-  GetObjectCommand,
-  DeleteObjectCommand
-} from '@aws-sdk/client-s3';
 import { Readable, Writable } from 'stream';
 import { WritableStream } from 'memory-streams';
+import { BUILDER_NAMESPACE } from './finder-builder';
+import axios from 'axios';
 
 const debug = makeDebug('nim:deployer:slice-reader');
 const TEMP = process.platform === 'win32' ? process.env.TEMP : '/tmp';
-const bucket = process.env.BUILDER_BUCKET_NAME;
-const endpoint = process.env.S3_ENDPOINT;
 // Environment must also contain AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
 
 // MAX_SLICE_UPLOAD_SIZE governs the maximum supported zipped size for a project slice
 export const MAX_SLICE_UPLOAD_SIZE =
   parseInt(process.env.MAX_SLICE_UPLOAD_SIZE) || 64 * 1024 * 1024;
-
-let s3Client: S3Client;
 
 // Supports the fetching and deletion of project slices from build bucket.
 // Uses the aws s3 client directly (does not go through the Nimbella storage
@@ -47,14 +40,6 @@ let s3Client: S3Client;
 // Get the cache area
 function cacheArea() {
   return path.join(TEMP, 'slices');
-}
-
-// Get the s3 client
-function getS3Client(): S3Client {
-  if (!s3Client) {
-    s3Client = new S3Client({ endpoint, region: 'us-east-1' });
-  }
-  return s3Client;
 }
 
 // Pipe data from one stream to another
@@ -73,20 +58,29 @@ function pipe(input: Readable, output: Writable): Promise<unknown> {
 
 // Fetch the slice to cache storage.
 export async function fetchSlice(sliceName: string): Promise<string> {
+  const GET_DOWNLOAD_URL = `${process.env.__OW_API_HOST}/v1/web/${BUILDER_NAMESPACE}/builder/getDownloadUrl`;
+  const downloadUrlResponse = await axios.get(GET_DOWNLOAD_URL, {
+    params: {
+      name: sliceName
+    }
+  });
+
+  const downloadUrl = downloadUrlResponse.data.response;
+  const response = await axios.get(downloadUrl, {
+    responseType: 'stream'
+  });
+
   const cache = path.join(cacheArea(), sliceName);
   if (fs.existsSync(cache)) {
     rimraf.sync(cache);
   }
   debug('Making cache directory: %s', cache);
   fs.mkdirSync(cache, { recursive: true });
-  const s3 = getS3Client();
-  const cmd = new GetObjectCommand({ Bucket: bucket, Key: sliceName });
-  const result = await s3.send(cmd);
-  const content = result.Body as Readable; // Body has type ReadableStream<any>|Readable|Blob.  Readable seems to work in practice
   const destination = new WritableStream({
     highWaterMark: MAX_SLICE_UPLOAD_SIZE
   });
-  await pipe(content, destination);
+
+  await pipe(response.data, destination);
   const data = (destination as WritableStream).toBuffer();
   const zip = new Zip(data);
   debug('zip file has %d entries', zip.getEntries().length);
@@ -105,8 +99,11 @@ export async function fetchSlice(sliceName: string): Promise<string> {
 
 // Delete
 export async function deleteSlice(project: DeployStructure): Promise<void> {
+  const DELETE_ASSETS_URL = `${process.env.__OW_API_HOST}/v1/web/${BUILDER_NAMESPACE}/builder/deleteBuildAssets`;
   const sliceName = path.relative(cacheArea(), project.filePath);
-  const s3 = getS3Client();
-  const cmd = new DeleteObjectCommand({ Bucket: bucket, Key: sliceName });
-  await s3.send(cmd);
+  await axios.delete(DELETE_ASSETS_URL, {
+    params: {
+      name: sliceName
+    }
+  });
 }
