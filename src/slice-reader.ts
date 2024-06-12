@@ -80,7 +80,7 @@ export async function fetchSlice(sliceName: string): Promise<string> {
     invoked.activationId,
     owClient,
     () => {
-      debug('removing build assets ...');
+      debug('fetching build assets ...');
     },
     60
   );
