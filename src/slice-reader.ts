@@ -21,6 +21,9 @@ import { Readable, Writable } from 'stream';
 import { WritableStream } from 'memory-streams';
 import { BUILDER_NAMESPACE } from './finder-builder';
 import axios from 'axios';
+import { getCredentialsFromEnvironment } from './credentials';
+import openwhisk from 'openwhisk';
+import { waitForActivation } from './util';
 
 const debug = makeDebug('nim:deployer:slice-reader');
 const TEMP = process.platform === 'win32' ? process.env.TEMP : '/tmp';
@@ -58,14 +61,40 @@ function pipe(input: Readable, output: Writable): Promise<unknown> {
 
 // Fetch the slice to cache storage.
 export async function fetchSlice(sliceName: string): Promise<string> {
-  const GET_DOWNLOAD_URL = `${process.env.__OW_API_HOST}/v1/web/${BUILDER_NAMESPACE}/builder/getDownloadUrl`;
-  const downloadUrlResponse = await axios.get(GET_DOWNLOAD_URL, {
+  const GET_DOWNLOAD_URL = `/${BUILDER_NAMESPACE}/builder/getDownloadUrl`;
+  const credentials = getCredentialsFromEnvironment();
+  const owClient = openwhisk({
+    apihost: credentials.ow.apihost,
+    api_key: credentials.ow.api_key,
+    namespace: credentials.namespace
+  });
+
+  const invoked = await owClient.actions.invoke({
+    name: GET_DOWNLOAD_URL,
     params: {
       name: sliceName
     }
   });
 
-  const downloadUrl = downloadUrlResponse.data.response;
+  const activation = await waitForActivation(
+    invoked.activationId,
+    owClient,
+    () => {
+      debug('removing build assets ...');
+    },
+    60
+  );
+
+  if (!activation) {
+    throw new Error(`Timed out fetching assets url for '${sliceName}'`);
+  }
+
+  const activationResponse = activation.response;
+  const downloadUrl = activation.response?.result?.url;
+  if (!activationResponse || !activationResponse?.success || !downloadUrl) {
+    throw new Error(`Failed to fetch assets url for '${sliceName}'`);
+  }
+
   const response = await axios.get(downloadUrl, {
     responseType: 'stream'
   });
@@ -99,11 +128,27 @@ export async function fetchSlice(sliceName: string): Promise<string> {
 
 // Delete
 export async function deleteSlice(project: DeployStructure): Promise<void> {
-  const DELETE_ASSETS_URL = `${process.env.__OW_API_HOST}/v1/web/${BUILDER_NAMESPACE}/builder/deleteBuildAssets`;
+  const DELETE_ASSETS_URL = `/${BUILDER_NAMESPACE}/builder/deleteBuildAssets`;
   const sliceName = path.relative(cacheArea(), project.filePath);
-  await axios.delete(DELETE_ASSETS_URL, {
+  const credentials = getCredentialsFromEnvironment();
+
+  const owClient = openwhisk({
+    apihost: credentials.ow.apihost,
+    api_key: credentials.ow.api_key,
+    namespace: credentials.namespace
+  });
+
+  const invoked = await owClient.actions.invoke({
+    name: DELETE_ASSETS_URL,
     params: {
       name: sliceName
     }
   });
+
+  await waitForActivation(
+    invoked.activationId,
+    owClient,
+    () => debug('removing build assets ...'),
+    60
+  );
 }
